@@ -41,7 +41,8 @@ app.get('/datos', async (req, res) => {
     const result = await sql.query('SELECT * FROM usuarios');
     res.json(result.recordset);
   } catch (err) {
-    res.status(500).send('Error en consulta');
+    console.error(err);
+    res.status(500).json({ error: err.message, code: err.code }); // <-- cambia esto
   }
 });
 
