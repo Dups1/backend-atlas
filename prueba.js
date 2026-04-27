@@ -21,9 +21,14 @@ const config = {
   }
 };
 
-sql.connect(config)
-  .then(() => console.log('Azure: Conectado'))
-  .catch(err => console.error('Azure: Error de conexion:', err));
+let pool;
+
+async function getPool() {
+  if (!pool) {
+    pool = await sql.connect(config);
+  }
+  return pool;
+}
 
 // Firebase Admin
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -38,11 +43,11 @@ console.log('Firebase: Admin inicializado');
 // --- Rutas Azure ---
 app.get('/datos', async (req, res) => {
   try {
-    const result = await sql.query('SELECT * FROM usuarios');
+    const pool = await getPool();
+    const result = await pool.query('SELECT * FROM usuarios');
     res.json(result.recordset);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message, code: err.code }); // <-- cambia esto
+    res.status(500).json({ error: err.message, code: err.code });
   }
 });
 
@@ -50,10 +55,13 @@ app.post('/datos', async (req, res) => {
   const { nombre } = req.body;
   if (!nombre) return res.status(400).send('El nombre es requerido');
   try {
-    await sql.query`INSERT INTO usuarios (nombre) VALUES (${nombre})`;
+    const pool = await getPool();
+    await pool.request()
+      .input('nombre', sql.VarChar, nombre)
+      .query('INSERT INTO usuarios (nombre) VALUES (@nombre)');
     res.send('Insertado');
   } catch (err) {
-    res.status(500).send(err.message);
+    res.status(500).json({ error: err.message, code: err.code });
   }
 });
 
@@ -61,20 +69,27 @@ app.put('/datos/:id', async (req, res) => {
   const { id } = req.params;
   const { nombre } = req.body;
   try {
-    await sql.query`UPDATE usuarios SET nombre = ${nombre} WHERE id = ${id}`;
+    const pool = await getPool();
+    await pool.request()
+      .input('nombre', sql.VarChar, nombre)
+      .input('id', sql.Int, id)
+      .query('UPDATE usuarios SET nombre = @nombre WHERE id = @id');
     res.send('Actualizado');
   } catch (err) {
-    res.status(500).send(err.message);
+    res.status(500).json({ error: err.message, code: err.code });
   }
 });
 
 app.delete('/datos/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    await sql.query`DELETE FROM usuarios WHERE id = ${id}`;
+    const pool = await getPool();
+    await pool.request()
+      .input('id', sql.Int, id)
+      .query('DELETE FROM usuarios WHERE id = @id');
     res.send('Eliminado');
   } catch (err) {
-    res.status(500).send(err.message);
+    res.status(500).json({ error: err.message, code: err.code });
   }
 });
 
