@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const admin = require('firebase-admin');
 const sql = require('mssql');
 const cors = require('cors');
 
@@ -7,7 +8,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-//config
+// Azure SQL
 const config = {
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
@@ -21,35 +22,38 @@ const config = {
 };
 
 sql.connect(config)
-  .then(() => console.log('Conectado'))
-  .catch(err => console.error('Error de conexión:', err));
+  .then(() => console.log('Azure: Conectado'))
+  .catch(err => console.error('Azure: Error de conexion:', err));
 
-//CRUD a bd
+// Firebase Admin
+admin.initializeApp({
+  credential: admin.credential.cert({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+  }),
+});
+
+const db = admin.firestore();
+console.log('Firebase: Admin inicializado');
+
+// --- Rutas Azure ---
 app.get('/datos', async (req, res) => {
   try {
     const result = await sql.query('SELECT * FROM usuarios');
     res.json(result.recordset);
   } catch (err) {
-    console.error(err);
     res.status(500).send('Error en consulta');
   }
 });
 
 app.post('/datos', async (req, res) => {
   const { nombre } = req.body;
-
-  if (!nombre) {
-    return res.status(400).send('El nombre es requerido');
-  }
-
+  if (!nombre) return res.status(400).send('El nombre es requerido');
   try {
-    await sql.query`
-      INSERT INTO usuarios (nombre)
-      VALUES (${nombre})
-    `;
+    await sql.query`INSERT INTO usuarios (nombre) VALUES (${nombre})`;
     res.send('Insertado');
   } catch (err) {
-    console.error(err);
     res.status(500).send(err.message);
   }
 });
@@ -57,37 +61,56 @@ app.post('/datos', async (req, res) => {
 app.put('/datos/:id', async (req, res) => {
   const { id } = req.params;
   const { nombre } = req.body;
-
   try {
-    await sql.query`
-      UPDATE usuarios
-      SET nombre = ${nombre}
-      WHERE id = ${id}
-    `;
+    await sql.query`UPDATE usuarios SET nombre = ${nombre} WHERE id = ${id}`;
     res.send('Actualizado');
   } catch (err) {
-    console.error(err);
     res.status(500).send(err.message);
   }
 });
 
 app.delete('/datos/:id', async (req, res) => {
   const { id } = req.params;
-
   try {
-    await sql.query`
-      DELETE FROM usuarios WHERE id = ${id}
-    `;
+    await sql.query`DELETE FROM usuarios WHERE id = ${id}`;
     res.send('Eliminado');
   } catch (err) {
-    console.error(err);
     res.status(500).send(err.message);
   }
 });
 
+// --- Rutas Firebase ---
+app.post('/firebase/verify-token', async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).send('Token requerido');
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    res.json({ uid: decoded.uid, email: decoded.email });
+  } catch (err) {
+    res.status(401).json({ error: 'Token invalido' });
+  }
+});
+
+app.get('/firebase/:coleccion', async (req, res) => {
+  try {
+    const snapshot = await db.collection(req.params.coleccion).get();
+    const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.json(docs);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/firebase/:coleccion', async (req, res) => {
+  try {
+    const ref = await db.collection(req.params.coleccion).add(req.body);
+    res.json({ id: ref.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Puerto: ${PORT}`);
 });
-//ola 2
