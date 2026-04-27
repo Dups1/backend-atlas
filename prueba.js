@@ -110,6 +110,26 @@ app.post('/firebase/:coleccion', async (req, res) => {
   }
 });
 
+// Insertar multiples documentos en batch
+app.post('/firebase/:coleccion/batch', async (req, res) => {
+  const { docs } = req.body;
+  if (!Array.isArray(docs) || docs.length === 0) {
+    return res.status(400).json({ error: 'Se requiere array "docs"' });
+  }
+  try {
+    const collection = db.collection(req.params.coleccion);
+    const batch = db.batch();
+    docs.forEach(doc => {
+      const ref = collection.doc();
+      batch.set(ref, { ...doc, creado: admin.firestore.FieldValue.serverTimestamp() });
+    });
+    await batch.commit();
+    res.json({ insertados: docs.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Puerto: ${PORT}`);
