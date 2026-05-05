@@ -35,6 +35,13 @@ const B2_BUCKET = process.env.B2_BUCKET_NAME;
 const B2_PUBLIC_BASE_URL = process.env.B2_PUBLIC_BASE_URL?.replace(/\/$/, '') ?? '';
 const upload = multer({ storage: multer.memoryStorage() });
 
+console.log('B2 config:', {
+  endpoint: process.env.B2_ENDPOINT,
+  region: process.env.B2_REGION,
+  bucket: process.env.B2_BUCKET_NAME,
+  publicBaseUrl: process.env.B2_PUBLIC_BASE_URL,
+});
+
 // Verificar token de Firebase Auth
 app.post('/firebase/verify-token', async (req, res) => {
   const { token } = req.body;
