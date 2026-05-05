@@ -1,34 +1,14 @@
 require('dotenv').config();
 const express = require('express');
 const admin = require('firebase-admin');
-const sql = require('mssql');
 const cors = require('cors');
+const multer = require('multer');
+const { S3Client, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// Azure SQL
-const config = {
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  server: process.env.DB_SERVER,
-  database: process.env.DB_DATABASE,
-  port: 1433,
-  options: {
-    encrypt: true,
-    trustServerCertificate: false
-  }
-};
-
-let pool;
-
-async function getPool() {
-  if (!pool) {
-    pool = await sql.connect(config);
-  }
-  return pool;
-}
 
 // Firebase Admin
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -40,60 +20,20 @@ admin.initializeApp({
 const db = admin.firestore();
 console.log('Firebase: Admin inicializado');
 
-// --- Rutas Azure ---
-app.get('/datos', async (req, res) => {
-  try {
-    const pool = await getPool();
-    const result = await pool.query('SELECT * FROM usuarios');
-    res.json(result.recordset);
-  } catch (err) {
-    res.status(500).json({ error: err.message, code: err.code });
-  }
+// Backblaze B2
+const s3 = new S3Client({
+  endpoint: process.env.B2_ENDPOINT,
+  region: process.env.B2_REGION,
+  credentials: {
+    accessKeyId: process.env.B2_KEY_ID,
+    secretAccessKey: process.env.B2_APPLICATION_KEY,
+  },
 });
 
-app.post('/datos', async (req, res) => {
-  const { nombre } = req.body;
-  if (!nombre) return res.status(400).send('El nombre es requerido');
-  try {
-    const pool = await getPool();
-    await pool.request()
-      .input('nombre', sql.VarChar, nombre)
-      .query('INSERT INTO usuarios (nombre) VALUES (@nombre)');
-    res.send('Insertado');
-  } catch (err) {
-    res.status(500).json({ error: err.message, code: err.code });
-  }
-});
+const B2_BUCKET = process.env.B2_BUCKET_NAME;
+const upload = multer({ storage: multer.memoryStorage() });
 
-app.put('/datos/:id', async (req, res) => {
-  const { id } = req.params;
-  const { nombre } = req.body;
-  try {
-    const pool = await getPool();
-    await pool.request()
-      .input('nombre', sql.VarChar, nombre)
-      .input('id', sql.Int, id)
-      .query('UPDATE usuarios SET nombre = @nombre WHERE id = @id');
-    res.send('Actualizado');
-  } catch (err) {
-    res.status(500).json({ error: err.message, code: err.code });
-  }
-});
-
-app.delete('/datos/:id', async (req, res) => {
-  const { id } = req.params;
-  try {
-    const pool = await getPool();
-    await pool.request()
-      .input('id', sql.Int, id)
-      .query('DELETE FROM usuarios WHERE id = @id');
-    res.send('Eliminado');
-  } catch (err) {
-    res.status(500).json({ error: err.message, code: err.code });
-  }
-});
-
-// --- Rutas Firebase ---
+// Verificar token de Firebase Auth
 app.post('/firebase/verify-token', async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).send('Token requerido');
@@ -105,6 +45,7 @@ app.post('/firebase/verify-token', async (req, res) => {
   }
 });
 
+// Leer coleccion
 app.get('/firebase/:coleccion', async (req, res) => {
   try {
     const snapshot = await db.collection(req.params.coleccion).get();
@@ -115,6 +56,7 @@ app.get('/firebase/:coleccion', async (req, res) => {
   }
 });
 
+// Insertar documento
 app.post('/firebase/:coleccion', async (req, res) => {
   try {
     const ref = await db.collection(req.params.coleccion).add(req.body);
@@ -139,6 +81,60 @@ app.post('/firebase/:coleccion/batch', async (req, res) => {
     });
     await batch.commit();
     res.json({ insertados: docs.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Rutas Backblaze B2 ---
+
+// Subir archivo
+app.post('/storage/upload', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No se recibio archivo' });
+  const key = `${Date.now()}-${req.file.originalname}`;
+  try {
+    await s3.send(new PutObjectCommand({
+      Bucket: B2_BUCKET,
+      Key: key,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype,
+    }));
+    res.json({ key, message: 'Archivo subido' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Listar archivos del bucket
+app.get('/storage', async (req, res) => {
+  try {
+    const data = await s3.send(new ListObjectsV2Command({ Bucket: B2_BUCKET }));
+    const files = (data.Contents || []).map(f => ({ key: f.Key, size: f.Size, modified: f.LastModified }));
+    res.json(files);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// URL firmada para descargar un archivo (expira en 1 hora)
+app.get('/storage/url/:key', async (req, res) => {
+  try {
+    const url = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: B2_BUCKET, Key: req.params.key }),
+      { expiresIn: 3600 }
+    );
+    res.json({ url });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Eliminar archivo
+app.delete('/storage/:key', async (req, res) => {
+  try {
+    await s3.send(new DeleteObjectCommand({ Bucket: B2_BUCKET, Key: req.params.key }));
+    res.json({ message: 'Archivo eliminado' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
