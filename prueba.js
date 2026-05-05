@@ -87,6 +87,11 @@ app.post('/firebase/:coleccion/batch', async (req, res) => {
   }
 });
 
+// Estado del backend
+app.get('/status', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // Obtener imagenes del laboratorio
 app.get('/firebase/laboratorio', async (req, res) => {
   try {
