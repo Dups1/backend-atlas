@@ -73,7 +73,7 @@ async function authenticateToken(req, res, next) {
 
 // Registro de usuario por correo y password
 app.post('/auth/register', async (req, res) => {
-  const { email, password, rol = 'cliente', categoria, subcategoria } = req.body;
+  const { email, password, rol = 'cliente', categoria, subcategoria, nombre } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'Email y password son obligatorios' });
   }
@@ -83,6 +83,7 @@ app.post('/auth/register', async (req, res) => {
     await db.collection('usuarios').doc(userRecord.uid).set({
       uid: userRecord.uid,
       email,
+      nombre: nombre ?? null,
       rol,
       categoria: categoria ?? null,
       subcategoria: subcategoria ?? null,
