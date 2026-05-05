@@ -28,6 +28,7 @@ const s3 = new S3Client({
     accessKeyId: process.env.B2_KEY_ID,
     secretAccessKey: process.env.B2_APPLICATION_KEY,
   },
+  forcePathStyle: true,
 });
 
 const B2_BUCKET = process.env.B2_BUCKET_NAME;
