@@ -54,6 +54,33 @@ app.post('/firebase/verify-token', async (req, res) => {
   }
 });
 
+// Obtener imagenes del laboratorio
+app.get('/firebase/laboratorio', async (req, res) => {
+  try {
+    const snapshot = await db
+      .collection('laboratorio_uploads')
+      .get();
+
+    const entries = snapshot.docs.map(doc => {
+      const data = doc.data();
+      const createdAt = data.createdAt;
+      return {
+        id: doc.id,
+        key: data.key,
+        url: data.url,
+        originalName: data.originalName,
+        createdAt: createdAt && typeof createdAt.toDate === 'function'
+          ? createdAt.toDate().toISOString()
+          : null,
+      };
+    });
+
+    res.json(entries);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Leer coleccion
 app.get('/firebase/:coleccion', async (req, res) => {
   try {
@@ -98,33 +125,6 @@ app.post('/firebase/:coleccion/batch', async (req, res) => {
 // Estado del backend
 app.get('/status', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Obtener imagenes del laboratorio
-app.get('/firebase/laboratorio', async (req, res) => {
-  try {
-    const snapshot = await db
-      .collection('laboratorio_uploads')
-      .get();
-
-    const entries = snapshot.docs.map(doc => {
-      const data = doc.data();
-      const createdAt = data.createdAt;
-      return {
-        id: doc.id,
-        key: data.key,
-        url: data.url,
-        originalName: data.originalName,
-        createdAt: createdAt && typeof createdAt.toDate === 'function'
-          ? createdAt.toDate().toISOString()
-          : null,
-      };
-    });
-
-    res.json(entries);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // --- Rutas Backblaze B2 ---
