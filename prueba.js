@@ -126,7 +126,13 @@ app.get('/firebase/laboratorio', async (req, res) => {
 app.post('/storage/upload', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No se recibio archivo' });
   const key = `${Date.now()}-${req.file.originalname}`;
+  console.log('Upload request start:', {
+    name: req.file.originalname,
+    size: req.file.size,
+    fieldname: req.file.fieldname,
+  });
   try {
+    console.log('Uploading to b2', key);
     await s3.send(new PutObjectCommand({
       Bucket: B2_BUCKET,
       Key: key,
@@ -142,8 +148,19 @@ app.post('/storage/upload', upload.single('file'), async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    console.log('Upload saved to Firestore', {
+      id: docRef.id,
+      url,
+      bucket: B2_BUCKET,
+      key,
+    });
+    console.log('Upload response ready', {
+      docId: docRef.id,
+      status: 'success',
+    });
     res.json({ key, url, docId: docRef.id });
   } catch (err) {
+    console.error('Upload failed', err);
     res.status(500).json({ error: err.message });
   }
 });
