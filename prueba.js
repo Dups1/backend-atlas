@@ -148,7 +148,7 @@ app.post('/storage/upload', upload.single('file'), async (req, res) => {
       ContentType: req.file.mimetype,
     }));
 
-    const url = `${B2_PUBLIC_BASE_URL}/${B2_BUCKET}/${key}`;
+    const url = `${B2_PUBLIC_BASE_URL}/${key}`;
     const docRef = await db.collection('laboratorio_uploads').add({
       key,
       url,
