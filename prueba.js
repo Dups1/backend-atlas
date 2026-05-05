@@ -31,6 +31,7 @@ const s3 = new S3Client({
 });
 
 const B2_BUCKET = process.env.B2_BUCKET_NAME;
+const B2_PUBLIC_BASE_URL = process.env.B2_PUBLIC_BASE_URL?.replace(/\/$/, '') ?? '';
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Verificar token de Firebase Auth
@@ -86,6 +87,34 @@ app.post('/firebase/:coleccion/batch', async (req, res) => {
   }
 });
 
+// Obtener imagenes del laboratorio
+app.get('/firebase/laboratorio', async (req, res) => {
+  try {
+    const snapshot = await db
+      .collection('laboratorio_uploads')
+      .orderBy('createdAt', 'desc')
+      .get();
+
+    const entries = snapshot.docs.map(doc => {
+      const data = doc.data();
+      const createdAt = data.createdAt;
+      return {
+        id: doc.id,
+        key: data.key,
+        url: data.url,
+        originalName: data.originalName,
+        createdAt: createdAt && typeof createdAt.toDate === 'function'
+          ? createdAt.toDate().toISOString()
+          : null,
+      };
+    });
+
+    res.json(entries);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- Rutas Backblaze B2 ---
 
 // Subir archivo
@@ -99,7 +128,16 @@ app.post('/storage/upload', upload.single('file'), async (req, res) => {
       Body: req.file.buffer,
       ContentType: req.file.mimetype,
     }));
-    res.json({ key, message: 'Archivo subido' });
+
+    const url = `${B2_PUBLIC_BASE_URL}/${B2_BUCKET}/${key}`;
+    const docRef = await db.collection('laboratorio_uploads').add({
+      key,
+      url,
+      originalName: req.file.originalname,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ key, url, docId: docRef.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
