@@ -42,6 +42,107 @@ console.log('B2 config:', {
   publicBaseUrl: process.env.B2_PUBLIC_BASE_URL,
 });
 
+const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
+
+const firebaseAuthUrl = (path) => {
+  if (!FIREBASE_API_KEY) return '';
+  return `https://identitytoolkit.googleapis.com/v1/${path}?key=${FIREBASE_API_KEY}`;
+};
+
+function ensureApiKey(req, res, next) {
+  if (!FIREBASE_API_KEY) {
+    return res.status(500).json({ error: 'Falta FIREBASE_API_KEY' });
+  }
+  next();
+}
+
+async function authenticateToken(req, res, next) {
+  const auth = req.headers['authorization'];
+  if (!auth || !auth.toString().startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Token requerido' });
+  }
+  const token = auth.toString().replace('Bearer ', '');
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.firebaseUid = decoded.uid;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Token invalido' });
+  }
+}
+
+// Registro de usuario por correo y password
+app.post('/auth/register', async (req, res) => {
+  const { email, password, rol = 'cliente', categoria, subcategoria } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email y password son obligatorios' });
+  }
+
+  try {
+    const userRecord = await admin.auth().createUser({ email, password });
+    await db.collection('usuarios').doc(userRecord.uid).set({
+      uid: userRecord.uid,
+      email,
+      rol,
+      categoria: categoria ?? null,
+      subcategoria: subcategoria ?? null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    res.status(201).json({ uid: userRecord.uid });
+  } catch (err) {
+    console.error('Auth register error', err);
+    if (err.code === 'auth/email-already-exists') {
+      return res.status(409).json({ error: 'Email ya registrado' });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Login con Firebase REST API
+app.post('/auth/login', ensureApiKey, async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email y password son obligatorios' });
+  }
+
+  try {
+    const response = await fetch(firebaseAuthUrl('accounts:signInWithPassword'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email,
+        password,
+        returnSecureToken: true,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      return res.status(response.status).json(data);
+    }
+    res.json(data);
+  } catch (err) {
+    console.error('Auth login error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/usuarios/me', authenticateToken, async (req, res) => {
+  try {
+    const uid = req.firebaseUid;
+    if (!uid) {
+      return res.status(401).json({ error: 'UID no encontrado' });
+    }
+    const doc = await db.collection('usuarios').doc(uid).get();
+    if (!doc.exists) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    res.json({ id: doc.id, ...doc.data() });
+  } catch (err) {
+    console.error('Perfil error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Verificar token de Firebase Auth
 app.post('/firebase/verify-token', async (req, res) => {
   const { token } = req.body;
