@@ -105,7 +105,6 @@ app.get('/firebase/laboratorio', async (req, res) => {
   try {
     const snapshot = await db
       .collection('laboratorio_uploads')
-      .orderBy('createdAt', 'desc')
       .get();
 
     const entries = snapshot.docs.map(doc => {
