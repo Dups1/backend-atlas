@@ -204,6 +204,16 @@ app.post('/firebase/:coleccion', async (req, res) => {
   }
 });
 
+// Actualizar documento por ID
+app.patch('/firebase/:coleccion/:id', async (req, res) => {
+  try {
+    await db.collection(req.params.coleccion).doc(req.params.id).update(req.body);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Insertar multiples documentos en batch
 app.post('/firebase/:coleccion/batch', async (req, res) => {
   const { docs } = req.body;
