@@ -5,6 +5,7 @@ const cors = require('cors');
 const multer = require('multer');
 const { S3Client, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
 
 const app = express();
 app.use(cors());
@@ -78,6 +79,356 @@ function nombreVisibleUsuario(doc) {
   if (doc.email) return String(doc.email);
   return null;
 }
+
+// =============================================================================
+// LLAMADAS DE VOZ (Agora token + Firestore + FCM): toda la logica de negocio aqui.
+// El cliente Flutter solo: motor RTC, permisos, UI y lectura Firestore.
+// =============================================================================
+const { FieldValue } = require('firebase-admin/firestore');
+
+const AGORA_APP_ID = process.env.AGORA_APP_ID || '';
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || '';
+
+const EST_LLAMADA = {
+  RINGING: 'ringing',
+  ACCEPTED: 'accepted',
+  REJECTED: 'rejected',
+  ENDED: 'ended',
+  MISSED: 'missed',
+  BUSY: 'busy',
+};
+
+/** Mismo algoritmo que Flutter (ServicioLaboratorio.uidAgoraDesdeUid). */
+function uidAgoraDesdeFirebaseUid(firebaseUid) {
+  let u = 0;
+  for (let i = 0; i < firebaseUid.length; i += 1) {
+    u = ((u << 5) - u + firebaseUid.charCodeAt(i)) >>> 0;
+  }
+  return u === 0 ? 1 : u;
+}
+
+function construirTokenRtc(canal, firebaseUid, expiraEnSegundos = 3600) {
+  if (!AGORA_APP_ID || !AGORA_APP_CERTIFICATE) {
+    const err = new Error('Faltan AGORA_APP_ID o AGORA_APP_CERTIFICATE en el servidor');
+    err.code = 'AGORA_ENV';
+    throw err;
+  }
+  const uidAgora = uidAgoraDesdeFirebaseUid(firebaseUid);
+  const expSeg = Math.min(Math.max(Number(expiraEnSegundos) || 3600, 60), 86400);
+  const privilegeExpiredTs = Math.floor(Date.now() / 1000) + expSeg;
+  const token = RtcTokenBuilder.buildTokenWithUid(
+    AGORA_APP_ID,
+    AGORA_APP_CERTIFICATE,
+    canal,
+    uidAgora,
+    RtcRole.PUBLISHER,
+    privilegeExpiredTs,
+  );
+  return { token, uidAgora, privilegeExpiredTs, canal };
+}
+
+async function enviarFcmLlamadaEntrante(idReceptor, { idLlamada, canal, idEmisor }) {
+  const snap = await db.collection('tokens_llamadas').doc(idReceptor).get();
+  const dataTok = snap.exists ? snap.data() : null;
+  const fcmToken = dataTok && dataTok.token ? String(dataTok.token) : null;
+  if (!fcmToken) {
+    return { enviado: false, motivo: 'sin_token_fcm' };
+  }
+  await admin.messaging().send({
+    token: fcmToken,
+    data: {
+      tipo: 'llamada_entrante',
+      idLlamada,
+      canal,
+      idEmisor,
+    },
+    android: { priority: 'high' },
+    apns: { headers: { 'apns-priority': '10' } },
+  });
+  return { enviado: true };
+}
+
+/** Documento activo con estado timbrando o en curso (ocupado). */
+async function buscarLlamadaActivaOcupante(uid) {
+  const [qEmisor, qReceptor] = await Promise.all([
+    db.collection('llamadas').where('idEmisor', '==', uid).where('activa', '==', true).limit(25).get(),
+    db.collection('llamadas').where('idReceptor', '==', uid).where('activa', '==', true).limit(25).get(),
+  ]);
+  const candidatos = [...qEmisor.docs, ...qReceptor.docs];
+  for (const d of candidatos) {
+    const e = d.data().estado;
+    if (e === EST_LLAMADA.RINGING || e === EST_LLAMADA.ACCEPTED) {
+      return d;
+    }
+  }
+  return null;
+}
+
+/** Token RTC (renovacion desde el cliente). */
+app.post('/llamadas/agora-token', authenticateToken, (req, res) => {
+  try {
+    const canal = req.body?.canal != null ? String(req.body.canal).trim() : '';
+    if (!canal || canal.length > 63) {
+      return res.status(400).json({ error: 'canal invalido (max 63 caracteres)' });
+    }
+    const exp = Number(req.body?.expiraEnSegundos) || 3600;
+    const out = construirTokenRtc(canal, req.firebaseUid, exp);
+    res.json({ ...out, agoraAppId: AGORA_APP_ID });
+  } catch (err) {
+    console.error('agora-token', err);
+    const code = err.code === 'AGORA_ENV' ? 503 : 500;
+    res.status(code).json({ error: err.message });
+  }
+});
+
+/** Crea la llamada en Firestore, comprueba ocupacion, FCM al receptor y devuelve credenciales RTC para el emisor. */
+app.post('/llamadas/iniciar', authenticateToken, async (req, res) => {
+  try {
+    const idEmisor = req.firebaseUid;
+    const idReceptor = req.body?.idReceptor != null ? String(req.body.idReceptor).trim() : '';
+    if (!idReceptor) {
+      return res.status(400).json({ error: 'idReceptor obligatorio' });
+    }
+    if (idEmisor === idReceptor) {
+      return res.status(400).json({ error: 'No puedes llamarte a ti mismo' });
+    }
+
+    const ocupEmisor = await buscarLlamadaActivaOcupante(idEmisor);
+    if (ocupEmisor) {
+      return res.status(409).json({ error: 'emisor_ocupado', idLlamadaActiva: ocupEmisor.id });
+    }
+    const ocupReceptor = await buscarLlamadaActivaOcupante(idReceptor);
+    if (ocupReceptor) {
+      return res.status(409).json({ error: 'receptor_ocupado', codigo: EST_LLAMADA.BUSY });
+    }
+
+    const ref = db.collection('llamadas').doc();
+    const idLlamada = ref.id;
+    const canal = `voz_${idLlamada}`;
+    const nombreEmisor = req.body?.nombreEmisor != null ? String(req.body.nombreEmisor).trim() : '';
+    const nombreReceptor = req.body?.nombreReceptor != null ? String(req.body.nombreReceptor).trim() : '';
+
+    const cred = construirTokenRtc(canal, idEmisor);
+
+    await ref.set({
+      idLlamada,
+      idEmisor,
+      idReceptor,
+      canal,
+      estado: EST_LLAMADA.RINGING,
+      fecha: FieldValue.serverTimestamp(),
+      activa: true,
+      ...(nombreEmisor ? { nombreEmisor } : {}),
+      ...(nombreReceptor ? { nombreReceptor } : {}),
+    });
+
+    let fcmRes = { enviado: false, motivo: 'no_intentado' };
+    try {
+      fcmRes = await enviarFcmLlamadaEntrante(idReceptor, { idLlamada, canal, idEmisor });
+    } catch (e) {
+      console.error('FCM iniciar', e);
+      fcmRes = { enviado: false, motivo: String(e.message || e) };
+    }
+
+    res.status(201).json({
+      idLlamada,
+      canal,
+      agoraAppId: AGORA_APP_ID,
+      token: cred.token,
+      uidAgora: cred.uidAgora,
+      privilegeExpiredTs: cred.privilegeExpiredTs,
+      fcm: fcmRes,
+    });
+  } catch (err) {
+    console.error('llamadas/iniciar', err);
+    const code = err.code === 'AGORA_ENV' ? 503 : 500;
+    res.status(code).json({ error: err.message });
+  }
+});
+
+/** Receptor acepta: valida estado, actualiza Firestore y devuelve token RTC. */
+app.post('/llamadas/aceptar', authenticateToken, async (req, res) => {
+  try {
+    const uid = req.firebaseUid;
+    const idLlamada = req.body?.idLlamada != null ? String(req.body.idLlamada).trim() : '';
+    if (!idLlamada) {
+      return res.status(400).json({ error: 'idLlamada obligatorio' });
+    }
+    const ref = db.collection('llamadas').doc(idLlamada);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'llamada_no_encontrada' });
+    }
+    const data = snap.data();
+    if (data.idReceptor !== uid) {
+      return res.status(403).json({ error: 'solo_el_receptor_puede_aceptar' });
+    }
+    if (data.estado !== EST_LLAMADA.RINGING) {
+      return res.status(409).json({ error: 'estado_invalido', estado: data.estado });
+    }
+
+    await ref.update({
+      estado: EST_LLAMADA.ACCEPTED,
+    });
+
+    const canal = String(data.canal || '');
+    const cred = construirTokenRtc(canal, uid);
+    res.json({
+      idLlamada,
+      canal,
+      agoraAppId: AGORA_APP_ID,
+      token: cred.token,
+      uidAgora: cred.uidAgora,
+      privilegeExpiredTs: cred.privilegeExpiredTs,
+    });
+  } catch (err) {
+    console.error('llamadas/aceptar', err);
+    const code = err.code === 'AGORA_ENV' ? 503 : 500;
+    res.status(code).json({ error: err.message });
+  }
+});
+
+/** Receptor rechaza timbre. */
+app.post('/llamadas/rechazar', authenticateToken, async (req, res) => {
+  try {
+    const uid = req.firebaseUid;
+    const idLlamada = req.body?.idLlamada != null ? String(req.body.idLlamada).trim() : '';
+    if (!idLlamada) {
+      return res.status(400).json({ error: 'idLlamada obligatorio' });
+    }
+    const ref = db.collection('llamadas').doc(idLlamada);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'llamada_no_encontrada' });
+    }
+    const data = snap.data();
+    if (data.idReceptor !== uid) {
+      return res.status(403).json({ error: 'solo_el_receptor_puede_rechazar' });
+    }
+    if (data.estado !== EST_LLAMADA.RINGING) {
+      return res.status(409).json({ error: 'estado_invalido', estado: data.estado });
+    }
+    await ref.update({
+      estado: EST_LLAMADA.REJECTED,
+      activa: false,
+    });
+    res.json({ ok: true, idLlamada });
+  } catch (err) {
+    console.error('llamadas/rechazar', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Emisor cuelga antes de que contesten (sigue en ringing). */
+app.post('/llamadas/cancelar-emisor', authenticateToken, async (req, res) => {
+  try {
+    const uid = req.firebaseUid;
+    const idLlamada = req.body?.idLlamada != null ? String(req.body.idLlamada).trim() : '';
+    if (!idLlamada) {
+      return res.status(400).json({ error: 'idLlamada obligatorio' });
+    }
+    const ref = db.collection('llamadas').doc(idLlamada);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'llamada_no_encontrada' });
+    }
+    const data = snap.data();
+    if (data.idEmisor !== uid) {
+      return res.status(403).json({ error: 'solo_el_emisor_puede_cancelar' });
+    }
+    if (data.estado !== EST_LLAMADA.RINGING) {
+      return res.status(409).json({ error: 'estado_invalido', estado: data.estado });
+    }
+    await ref.update({
+      estado: EST_LLAMADA.ENDED,
+      activa: false,
+    });
+    res.json({ ok: true, idLlamada });
+  } catch (err) {
+    console.error('llamadas/cancelar-emisor', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Cualquier participante cuelga llamada en curso o finaliza sesion. */
+app.post('/llamadas/finalizar', authenticateToken, async (req, res) => {
+  try {
+    const uid = req.firebaseUid;
+    const idLlamada = req.body?.idLlamada != null ? String(req.body.idLlamada).trim() : '';
+    if (!idLlamada) {
+      return res.status(400).json({ error: 'idLlamada obligatorio' });
+    }
+    const ref = db.collection('llamadas').doc(idLlamada);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'llamada_no_encontrada' });
+    }
+    const data = snap.data();
+    if (data.idEmisor !== uid && data.idReceptor !== uid) {
+      return res.status(403).json({ error: 'no_participante' });
+    }
+    await ref.update({
+      estado: EST_LLAMADA.ENDED,
+      activa: false,
+    });
+    res.json({ ok: true, idLlamada });
+  } catch (err) {
+    console.error('llamadas/finalizar', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Timeout de timbre: solo el emisor y solo si sigue en ringing (sustituye logica en cliente). */
+app.post('/llamadas/marcar-perdida', authenticateToken, async (req, res) => {
+  try {
+    const uid = req.firebaseUid;
+    const idLlamada = req.body?.idLlamada != null ? String(req.body.idLlamada).trim() : '';
+    if (!idLlamada) {
+      return res.status(400).json({ error: 'idLlamada obligatorio' });
+    }
+    const ref = db.collection('llamadas').doc(idLlamada);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'llamada_no_encontrada' });
+    }
+    const data = snap.data();
+    if (data.idEmisor !== uid) {
+      return res.status(403).json({ error: 'solo_el_emisor_puede_marcar_perdida' });
+    }
+    if (data.estado !== EST_LLAMADA.RINGING) {
+      return res.json({ ok: true, sin_cambios: true, estado: data.estado });
+    }
+    await ref.update({
+      estado: EST_LLAMADA.MISSED,
+      activa: false,
+    });
+    res.json({ ok: true, idLlamada });
+  } catch (err) {
+    console.error('llamadas/marcar-perdida', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Compatibilidad: reenvia FCM (la ruta preferida es POST /llamadas/iniciar). */
+app.post('/llamadas/notificar-entrante', authenticateToken, async (req, res) => {
+  try {
+    const idReceptor = req.body?.idReceptor != null ? String(req.body.idReceptor).trim() : '';
+    const idLlamada = req.body?.idLlamada != null ? String(req.body.idLlamada).trim() : '';
+    const canal = req.body?.canal != null ? String(req.body.canal).trim() : '';
+    if (!idReceptor || !idLlamada || !canal) {
+      return res.status(400).json({ error: 'idReceptor, idLlamada y canal son obligatorios' });
+    }
+    const fcmRes = await enviarFcmLlamadaEntrante(idReceptor, {
+      idLlamada,
+      canal,
+      idEmisor: req.firebaseUid,
+    });
+    res.json(fcmRes);
+  } catch (err) {
+    console.error('notificar-entrante', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Custom token para Firebase Client SDK (Firestore snapshots en Flutter)
 app.post('/auth/custom-token', authenticateToken, async (req, res) => {
