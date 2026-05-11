@@ -173,7 +173,29 @@ app.get('/mensajes/conversaciones', authenticateToken, async (req, res) => {
         creado: tsToIso(data.creado),
       };
     });
-    res.json(items);
+
+    const uidSet = new Set();
+    for (const it of items) {
+      if (it.clienteUid) uidSet.add(it.clienteUid);
+      if (it.trabajadorUid) uidSet.add(it.trabajadorUid);
+    }
+    const nombrePorUid = {};
+    await Promise.all(
+      [...uidSet].map(async (uid) => {
+        const udoc = await db.collection('usuarios').doc(uid).get();
+        if (udoc.exists) {
+          const d = udoc.data();
+          nombrePorUid[uid] = (d.nombre && String(d.nombre).trim()) || d.email || uid;
+        }
+      }),
+    );
+
+    const enriched = items.map((it) => ({
+      ...it,
+      clienteNombre: it.clienteUid ? (nombrePorUid[it.clienteUid] ?? null) : null,
+      trabajadorNombre: it.trabajadorUid ? (nombrePorUid[it.trabajadorUid] ?? null) : null,
+    }));
+    res.json(enriched);
   } catch (err) {
     console.error('mensajes/conversaciones GET', err);
     res.status(500).json({ error: err.message });
