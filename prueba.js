@@ -71,6 +71,25 @@ async function authenticateToken(req, res, next) {
   }
 }
 
+function nombreVisibleUsuario(doc) {
+  if (!doc) return null;
+  const n = doc.nombre != null ? String(doc.nombre).trim() : '';
+  if (n) return n;
+  if (doc.email) return String(doc.email);
+  return null;
+}
+
+// Custom token para Firebase Client SDK (Firestore snapshots en Flutter)
+app.post('/auth/custom-token', authenticateToken, async (req, res) => {
+  try {
+    const customToken = await admin.auth().createCustomToken(req.firebaseUid);
+    res.json({ customToken });
+  } catch (err) {
+    console.error('custom-token', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- Mensajes (cliente / trabajador) ---
 
 function makeConversationId(uidA, uidB) {
@@ -131,10 +150,14 @@ app.post('/mensajes/conversaciones', authenticateToken, async (req, res) => {
 
     const ref = db.collection('conversaciones').doc(conversationId);
     const existente = await ref.get();
+    const clienteDoc = rolYo === 'cliente' ? yo : otro;
+    const trabajadorDoc = rolYo === 'trabajador' ? yo : otro;
     const payload = {
       participantes: [meUid, otroUid],
       clienteUid,
       trabajadorUid,
+      clienteNombre: nombreVisibleUsuario(clienteDoc),
+      trabajadorNombre: nombreVisibleUsuario(trabajadorDoc),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
     if (!existente.exists) {
