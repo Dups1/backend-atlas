@@ -71,6 +71,197 @@ async function authenticateToken(req, res, next) {
   }
 }
 
+// --- Mensajes (cliente / trabajador) ---
+
+function makeConversationId(uidA, uidB) {
+  return [uidA, uidB].sort().join('_');
+}
+
+function normalizeRol(rol) {
+  return String(rol ?? 'cliente').toLowerCase();
+}
+
+async function fetchUsuarioDoc(uid) {
+  const doc = await db.collection('usuarios').doc(uid).get();
+  if (!doc.exists) return null;
+  return { id: doc.id, ...doc.data() };
+}
+
+function assertParticipant(convData, uid) {
+  const parts = convData?.participantes;
+  if (!Array.isArray(parts) || !parts.includes(uid)) {
+    return false;
+  }
+  return true;
+}
+
+function tsToIso(v) {
+  if (v && typeof v.toDate === 'function') return v.toDate().toISOString();
+  return null;
+}
+
+// Crear o asegurar conversacion cliente-trabajador (mismo id para ambos lados)
+app.post('/mensajes/conversaciones', authenticateToken, async (req, res) => {
+  const otroUid = req.body?.otroUid;
+  if (!otroUid || typeof otroUid !== 'string') {
+    return res.status(400).json({ error: 'Body requiere otroUid (string)' });
+  }
+  const meUid = req.firebaseUid;
+  if (otroUid === meUid) {
+    return res.status(400).json({ error: 'No puedes conversar contigo mismo' });
+  }
+
+  try {
+    const [yo, otro] = await Promise.all([fetchUsuarioDoc(meUid), fetchUsuarioDoc(otroUid)]);
+    if (!yo) return res.status(404).json({ error: 'Tu usuario no existe en usuarios' });
+    if (!otro) return res.status(404).json({ error: 'Usuario destino no encontrado' });
+
+    const rolYo = normalizeRol(yo.rol);
+    const rolOtro = normalizeRol(otro.rol);
+    const okPair =
+      (rolYo === 'cliente' && rolOtro === 'trabajador') ||
+      (rolYo === 'trabajador' && rolOtro === 'cliente');
+    if (!okPair) {
+      return res.status(403).json({ error: 'Solo se permiten conversaciones entre cliente y trabajador' });
+    }
+
+    const conversationId = makeConversationId(meUid, otroUid);
+    const clienteUid = rolYo === 'cliente' ? meUid : otroUid;
+    const trabajadorUid = rolYo === 'trabajador' ? meUid : otroUid;
+
+    const ref = db.collection('conversaciones').doc(conversationId);
+    const existente = await ref.get();
+    const payload = {
+      participantes: [meUid, otroUid],
+      clienteUid,
+      trabajadorUid,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    if (!existente.exists) {
+      payload.creado = admin.firestore.FieldValue.serverTimestamp();
+    }
+    await ref.set(payload, { merge: true });
+
+    res.status(200).json({ conversationId });
+  } catch (err) {
+    console.error('mensajes/conversaciones POST', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Listar conversaciones del usuario actual
+app.get('/mensajes/conversaciones', authenticateToken, async (req, res) => {
+  const meUid = req.firebaseUid;
+  try {
+    const snap = await db
+      .collection('conversaciones')
+      .where('participantes', 'array-contains', meUid)
+      .orderBy('updatedAt', 'desc')
+      .limit(50)
+      .get();
+
+    const items = snap.docs.map((doc) => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        participantes: data.participantes,
+        clienteUid: data.clienteUid,
+        trabajadorUid: data.trabajadorUid,
+        ultimoMensaje: data.ultimoMensaje ?? null,
+        ultimoSenderUid: data.ultimoSenderUid ?? null,
+        updatedAt: tsToIso(data.updatedAt),
+        creado: tsToIso(data.creado),
+      };
+    });
+    res.json(items);
+  } catch (err) {
+    console.error('mensajes/conversaciones GET', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Listar mensajes de una conversacion
+app.get('/mensajes/conversaciones/:conversationId/mensajes', authenticateToken, async (req, res) => {
+  const meUid = req.firebaseUid;
+  const { conversationId } = req.params;
+  const limitNum = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+  const antesDe = req.query.antesDe;
+
+  try {
+    const convRef = db.collection('conversaciones').doc(conversationId);
+    const convSnap = await convRef.get();
+    if (!convSnap.exists) {
+      return res.status(404).json({ error: 'Conversacion no encontrada' });
+    }
+    const convData = convSnap.data();
+    if (!assertParticipant(convData, meUid)) {
+      return res.status(403).json({ error: 'No participas en esta conversacion' });
+    }
+
+    let q = convRef.collection('mensajes').orderBy('createdAt', 'desc').limit(limitNum);
+    if (antesDe) {
+      const cursor = await convRef.collection('mensajes').doc(antesDe).get();
+      if (cursor.exists) {
+        q = q.startAfter(cursor);
+      }
+    }
+    const snap = await q.get();
+    const mensajes = snap.docs.map((doc) => {
+      const d = doc.data();
+      return {
+        id: doc.id,
+        conversationId,
+        senderUid: d.senderUid,
+        texto: d.texto,
+        createdAt: tsToIso(d.createdAt),
+      };
+    });
+    res.json(mensajes);
+  } catch (err) {
+    console.error('mensajes GET lista', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Enviar mensaje
+app.post('/mensajes/conversaciones/:conversationId', authenticateToken, async (req, res) => {
+  const meUid = req.firebaseUid;
+  const { conversationId } = req.params;
+  const texto = (req.body?.texto ?? '').toString().trim();
+  if (!texto) {
+    return res.status(400).json({ error: 'texto es obligatorio' });
+  }
+
+  try {
+    const convRef = db.collection('conversaciones').doc(conversationId);
+    const convSnap = await convRef.get();
+    if (!convSnap.exists) {
+      return res.status(404).json({ error: 'Conversacion no encontrada' });
+    }
+    const convData = convSnap.data();
+    if (!assertParticipant(convData, meUid)) {
+      return res.status(403).json({ error: 'No participas en esta conversacion' });
+    }
+
+    const msgRef = await convRef.collection('mensajes').add({
+      senderUid: meUid,
+      texto,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await convRef.update({
+      ultimoMensaje: texto,
+      ultimoSenderUid: meUid,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.status(201).json({ id: msgRef.id, conversationId });
+  } catch (err) {
+    console.error('mensajes POST enviar', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Registro de usuario por correo y password
 app.post('/auth/register', async (req, res) => {
   const { email, password, rol = 'cliente', categoria, subcategoria, nombre } = req.body;
@@ -186,7 +377,13 @@ app.get('/firebase/laboratorio', async (req, res) => {
 // Leer coleccion
 app.get('/firebase/:coleccion', async (req, res) => {
   try {
-    const snapshot = await db.collection(req.params.coleccion).get();
+    let query = db.collection(req.params.coleccion);
+    // Filtros opcionales: ?campo=valor (excluye parametros internos)
+    const skip = new Set(['limit', 'offset']);
+    for (const [key, value] of Object.entries(req.query)) {
+      if (!skip.has(key)) query = query.where(key, '==', value);
+    }
+    const snapshot = await query.get();
     const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     res.json(docs);
   } catch (err) {
