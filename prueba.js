@@ -1,4 +1,5 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
@@ -98,33 +99,79 @@ const EST_LLAMADA = {
   BUSY: 'busy',
 };
 
-/** Mismo algoritmo que Flutter (ServicioLaboratorio.uidAgoraDesdeUid). */
+/** UID Agora uint32 estable: primeros 4 bytes de SHA-256(UID Firebase). Misma logica en Flutter. */
 function uidAgoraDesdeFirebaseUid(firebaseUid) {
-  let u = 0;
-  for (let i = 0; i < firebaseUid.length; i += 1) {
-    u = ((u << 5) - u + firebaseUid.charCodeAt(i)) >>> 0;
-  }
+  const buf = crypto.createHash('sha256').update(String(firebaseUid), 'utf8').digest();
+  const u = buf.readUInt32BE(0);
   return u === 0 ? 1 : u;
 }
 
-function construirTokenRtc(canal, firebaseUid, expiraEnSegundos = 3600) {
+/** Nombre de canal Agora (reglas Agora: longitud y caracteres). */
+function validarNombreCanal(canal) {
+  const c = String(canal ?? '').trim();
+  if (!c || c.length > 63) {
+    const err = new Error('canal invalido o vacio (max 63 caracteres)');
+    err.code = 'BAD_CANAL';
+    throw err;
+  }
+  return c;
+}
+
+/**
+ * Segundos hasta expiracion del privilegio en token (60..86400).
+ * undefined/null -> 3600. Valores no finitos o <= 0 -> error (sin sustituir por 3600 en silencio).
+ */
+function normalizarExpiraSegundos(val) {
+  if (val === undefined || val === null) return 3600;
+  const n = Number(val);
+  if (!Number.isFinite(n)) {
+    const err = new Error('expiraEnSegundos debe ser un numero finito');
+    err.code = 'BAD_EXP';
+    throw err;
+  }
+  if (n <= 0) {
+    const err = new Error('expiraEnSegundos debe ser > 0 (minimo aplicado en token: 60 s)');
+    err.code = 'BAD_EXP';
+    throw err;
+  }
+  return Math.min(Math.max(Math.floor(n), 60), 86400);
+}
+
+function construirTokenRtc(canal, firebaseUid, expiraEnSegundos) {
   if (!AGORA_APP_ID || !AGORA_APP_CERTIFICATE) {
     const err = new Error('Faltan AGORA_APP_ID o AGORA_APP_CERTIFICATE en el servidor');
     err.code = 'AGORA_ENV';
     throw err;
   }
+  const c = validarNombreCanal(canal);
   const uidAgora = uidAgoraDesdeFirebaseUid(firebaseUid);
-  const expSeg = Math.min(Math.max(Number(expiraEnSegundos) || 3600, 60), 86400);
+  const expSeg =
+    expiraEnSegundos === undefined || expiraEnSegundos === null
+      ? 3600
+      : normalizarExpiraSegundos(expiraEnSegundos);
   const privilegeExpiredTs = Math.floor(Date.now() / 1000) + expSeg;
   const token = RtcTokenBuilder.buildTokenWithUid(
     AGORA_APP_ID,
     AGORA_APP_CERTIFICATE,
-    canal,
+    c,
     uidAgora,
     RtcRole.PUBLISHER,
     privilegeExpiredTs,
   );
-  return { token, uidAgora, privilegeExpiredTs, canal };
+  return { token, uidAgora, privilegeExpiredTs, canal: c };
+}
+
+/** Quita idLlamadaActiva en presencia de ambos participantes (Admin SDK). */
+async function limpiarPresenciaParticipantes(idLlamada) {
+  const ref = db.collection('llamadas').doc(idLlamada);
+  const snap = await ref.get();
+  if (!snap.exists) return;
+  const { idEmisor, idReceptor } = snap.data();
+  const batch = db.batch();
+  const del = { idLlamadaActiva: FieldValue.delete() };
+  if (idEmisor) batch.set(db.collection('llamadas_presencia').doc(idEmisor), del, { merge: true });
+  if (idReceptor) batch.set(db.collection('llamadas_presencia').doc(idReceptor), del, { merge: true });
+  await batch.commit();
 }
 
 async function enviarFcmLlamadaEntrante(idReceptor, { idLlamada, canal, idEmisor }) {
@@ -148,40 +195,26 @@ async function enviarFcmLlamadaEntrante(idReceptor, { idLlamada, canal, idEmisor
   return { enviado: true };
 }
 
-/** Documento activo con estado timbrando o en curso (ocupado). */
-async function buscarLlamadaActivaOcupante(uid) {
-  const [qEmisor, qReceptor] = await Promise.all([
-    db.collection('llamadas').where('idEmisor', '==', uid).where('activa', '==', true).limit(25).get(),
-    db.collection('llamadas').where('idReceptor', '==', uid).where('activa', '==', true).limit(25).get(),
-  ]);
-  const candidatos = [...qEmisor.docs, ...qReceptor.docs];
-  for (const d of candidatos) {
-    const e = d.data().estado;
-    if (e === EST_LLAMADA.RINGING || e === EST_LLAMADA.ACCEPTED) {
-      return d;
-    }
-  }
-  return null;
-}
-
 /** Token RTC (renovacion desde el cliente). */
 app.post('/llamadas/agora-token', authenticateToken, (req, res) => {
   try {
     const canal = req.body?.canal != null ? String(req.body.canal).trim() : '';
-    if (!canal || canal.length > 63) {
-      return res.status(400).json({ error: 'canal invalido (max 63 caracteres)' });
-    }
-    const exp = Number(req.body?.expiraEnSegundos) || 3600;
+    validarNombreCanal(canal);
+    const expRaw = req.body?.expiraEnSegundos;
+    const exp = expRaw === undefined || expRaw === null ? 3600 : normalizarExpiraSegundos(expRaw);
     const out = construirTokenRtc(canal, req.firebaseUid, exp);
     res.json({ ...out, agoraAppId: AGORA_APP_ID });
   } catch (err) {
     console.error('agora-token', err);
+    if (err.code === 'BAD_EXP' || err.code === 'BAD_CANAL') {
+      return res.status(400).json({ error: err.message });
+    }
     const code = err.code === 'AGORA_ENV' ? 503 : 500;
     res.status(code).json({ error: err.message });
   }
 });
 
-/** Crea la llamada en Firestore, comprueba ocupacion, FCM al receptor y devuelve credenciales RTC para el emisor. */
+/** Crea la llamada en Firestore con transaccion (presencia + anti carrera), FCM y token emisor. */
 app.post('/llamadas/iniciar', authenticateToken, async (req, res) => {
   try {
     const idEmisor = req.firebaseUid;
@@ -193,34 +226,72 @@ app.post('/llamadas/iniciar', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'No puedes llamarte a ti mismo' });
     }
 
-    const ocupEmisor = await buscarLlamadaActivaOcupante(idEmisor);
-    if (ocupEmisor) {
-      return res.status(409).json({ error: 'emisor_ocupado', idLlamadaActiva: ocupEmisor.id });
-    }
-    const ocupReceptor = await buscarLlamadaActivaOcupante(idReceptor);
-    if (ocupReceptor) {
-      return res.status(409).json({ error: 'receptor_ocupado', codigo: EST_LLAMADA.BUSY });
-    }
-
-    const ref = db.collection('llamadas').doc();
-    const idLlamada = ref.id;
-    const canal = `voz_${idLlamada}`;
     const nombreEmisor = req.body?.nombreEmisor != null ? String(req.body.nombreEmisor).trim() : '';
     const nombreReceptor = req.body?.nombreReceptor != null ? String(req.body.nombreReceptor).trim() : '';
 
-    const cred = construirTokenRtc(canal, idEmisor);
+    let idLlamada;
+    let canal;
+    try {
+      const txResult = await db.runTransaction(async (t) => {
+        const refE = db.collection('llamadas_presencia').doc(idEmisor);
+        const refR = db.collection('llamadas_presencia').doc(idReceptor);
+        const [snapE, snapR] = await Promise.all([t.get(refE), t.get(refR)]);
 
-    await ref.set({
-      idLlamada,
-      idEmisor,
-      idReceptor,
-      canal,
-      estado: EST_LLAMADA.RINGING,
-      fecha: FieldValue.serverTimestamp(),
-      activa: true,
-      ...(nombreEmisor ? { nombreEmisor } : {}),
-      ...(nombreReceptor ? { nombreReceptor } : {}),
-    });
+        const asegurarLibre = async (snap, rol) => {
+          if (!snap.exists) return;
+          const activaId = snap.data()?.idLlamadaActiva;
+          if (!activaId) return;
+          const cSnap = await t.get(db.collection('llamadas').doc(String(activaId)));
+          if (!cSnap.exists) {
+            t.set(snap.ref, { idLlamadaActiva: FieldValue.delete() }, { merge: true });
+            return;
+          }
+          const cd = cSnap.data();
+          if (cd.activa === true && (cd.estado === EST_LLAMADA.RINGING || cd.estado === EST_LLAMADA.ACCEPTED)) {
+            const err = new Error(rol === 'emisor' ? 'emisor_ocupado' : 'receptor_ocupado');
+            err.statusCode = 409;
+            if (rol === 'receptor') err.codigo = EST_LLAMADA.BUSY;
+            if (rol === 'emisor') err.idLlamadaActiva = String(activaId);
+            throw err;
+          }
+          t.set(snap.ref, { idLlamadaActiva: FieldValue.delete() }, { merge: true });
+        };
+
+        await asegurarLibre(snapE, 'emisor');
+        await asegurarLibre(snapR, 'receptor');
+
+        const refCall = db.collection('llamadas').doc();
+        const newId = refCall.id;
+        const newCanal = `voz_${newId}`;
+        t.set(refCall, {
+          idLlamada: newId,
+          idEmisor,
+          idReceptor,
+          canal: newCanal,
+          estado: EST_LLAMADA.RINGING,
+          fecha: FieldValue.serverTimestamp(),
+          activa: true,
+          ...(nombreEmisor ? { nombreEmisor } : {}),
+          ...(nombreReceptor ? { nombreReceptor } : {}),
+        });
+        t.set(refE, { idLlamadaActiva: newId }, { merge: true });
+        t.set(refR, { idLlamadaActiva: newId }, { merge: true });
+        return { idLlamada: newId, canal: newCanal };
+      });
+      idLlamada = txResult.idLlamada;
+      canal = txResult.canal;
+    } catch (e) {
+      if (e.statusCode === 409) {
+        return res.status(409).json({
+          error: e.message,
+          ...(e.codigo ? { codigo: e.codigo } : {}),
+          ...(e.idLlamadaActiva ? { idLlamadaActiva: e.idLlamadaActiva } : {}),
+        });
+      }
+      throw e;
+    }
+
+    const cred = construirTokenRtc(canal, idEmisor, undefined);
 
     let fcmRes = { enviado: false, motivo: 'no_intentado' };
     try {
@@ -267,15 +338,21 @@ app.post('/llamadas/aceptar', authenticateToken, async (req, res) => {
       return res.status(409).json({ error: 'estado_invalido', estado: data.estado });
     }
 
+    let cred;
+    try {
+      const canalOk = validarNombreCanal(data.canal);
+      cred = construirTokenRtc(canalOk, uid, undefined);
+    } catch (e) {
+      return res.status(500).json({ error: 'llamada_sin_canal_valido', detalle: e.message });
+    }
+
     await ref.update({
       estado: EST_LLAMADA.ACCEPTED,
     });
 
-    const canal = String(data.canal || '');
-    const cred = construirTokenRtc(canal, uid);
     res.json({
       idLlamada,
-      canal,
+      canal: cred.canal,
       agoraAppId: AGORA_APP_ID,
       token: cred.token,
       uidAgora: cred.uidAgora,
@@ -312,6 +389,7 @@ app.post('/llamadas/rechazar', authenticateToken, async (req, res) => {
       estado: EST_LLAMADA.REJECTED,
       activa: false,
     });
+    await limpiarPresenciaParticipantes(idLlamada);
     res.json({ ok: true, idLlamada });
   } catch (err) {
     console.error('llamadas/rechazar', err);
@@ -343,6 +421,7 @@ app.post('/llamadas/cancelar-emisor', authenticateToken, async (req, res) => {
       estado: EST_LLAMADA.ENDED,
       activa: false,
     });
+    await limpiarPresenciaParticipantes(idLlamada);
     res.json({ ok: true, idLlamada });
   } catch (err) {
     console.error('llamadas/cancelar-emisor', err);
@@ -371,6 +450,7 @@ app.post('/llamadas/finalizar', authenticateToken, async (req, res) => {
       estado: EST_LLAMADA.ENDED,
       activa: false,
     });
+    await limpiarPresenciaParticipantes(idLlamada);
     res.json({ ok: true, idLlamada });
   } catch (err) {
     console.error('llamadas/finalizar', err);
@@ -402,6 +482,7 @@ app.post('/llamadas/marcar-perdida', authenticateToken, async (req, res) => {
       estado: EST_LLAMADA.MISSED,
       activa: false,
     });
+    await limpiarPresenciaParticipantes(idLlamada);
     res.json({ ok: true, idLlamada });
   } catch (err) {
     console.error('llamadas/marcar-perdida', err);
@@ -418,6 +499,7 @@ app.post('/llamadas/notificar-entrante', authenticateToken, async (req, res) => 
     if (!idReceptor || !idLlamada || !canal) {
       return res.status(400).json({ error: 'idReceptor, idLlamada y canal son obligatorios' });
     }
+    validarNombreCanal(canal);
     const fcmRes = await enviarFcmLlamadaEntrante(idReceptor, {
       idLlamada,
       canal,
@@ -426,6 +508,9 @@ app.post('/llamadas/notificar-entrante', authenticateToken, async (req, res) => 
     res.json(fcmRes);
   } catch (err) {
     console.error('notificar-entrante', err);
+    if (err.code === 'BAD_CANAL') {
+      return res.status(400).json({ error: err.message });
+    }
     res.status(500).json({ error: err.message });
   }
 });
